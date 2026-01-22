@@ -2,8 +2,7 @@
  * Reproduction script for node-pty FD leak
  * 
  * Issue: Each PTY spawn leaks one /dev/ptmx file descriptor, even after the
- * child process exits. The internal socket cleanup happens, but the PTY master
- * FD is not being closed properly.
+ * child process exits. Eventually this leads to "posix_spawnp failed" errors.
  * 
  * Run with: node repro.js
  */
@@ -34,78 +33,70 @@ async function main() {
   console.log('=======================================');
   console.log(`PID: ${process.pid}`);
   console.log('');
-  
-  const ITERATIONS = 5;
-  
-  console.log('=== INITIAL STATE ===');
-  const initialPtmx = getPtmxFDs();
-  console.log(`ptmx FDs: ${initialPtmx.length}`);
-  if (initialPtmx.length > 0) {
-    initialPtmx.forEach(line => console.log('  ' + line));
-  }
+  console.log('Spawning PTYs until we hit "posix_spawnp failed"...');
   console.log('');
   
-  for (let i = 1; i <= ITERATIONS; i++) {
-    console.log(`--- Spawn ${i} ---`);
+  let i = 0;
+  
+  while (true) {
+    i++;
     
-    // Spawn a PTY that does some real work
-    const p = pty.spawn('bash', ['-c', `
-      echo "Hello from spawn ${i}"
-      ls -la /tmp | head -5
-      sleep 5
-      echo "Done with spawn ${i}"
-    `], {
-      name: 'xterm-color',
-      cols: 80,
-      rows: 24
-    });
-    
-    // Collect output
-    let output = '';
-    p.onData(data => { output += data; });
-    
-    // Wait for process to exit
-    await new Promise(r => p.onExit(r));
-
-    console.log('Output received:');
-    console.log(output.split('\n').map(l => '  > ' + l).join('\n'));
-    
-    // This is what copilot-agent-runtime does in shutdown() - calls kill()
     try {
-      p.kill();
-    } catch (e) {
-      // Process already dead, ignore
+      // Spawn a PTY that does some real work
+      const p = pty.spawn('bash', ['-c', `
+        echo "Hello from spawn ${i}"
+        ls -la /tmp | head -3
+        echo "Done"
+      `], {
+        name: 'xterm-color',
+        cols: 80,
+        rows: 24
+      });
+      
+      // Collect output
+      let output = '';
+      p.onData(data => { output += data; });
+      
+      // Wait for process to exit
+      await new Promise(r => p.onExit(r));
+      
+      // This is what copilot-agent-runtime does in shutdown() - calls kill()
+      try {
+        p.kill();
+      } catch (e) {
+        // Process already dead, ignore
+      }
+      
+      // Wait for internal cleanup
+      await sleep(100);
+      
+      if (i % 50 === 0) {
+        const ptmxFDs = getPtmxFDs();
+        console.log(`Spawn ${i}: ${ptmxFDs.length} ptmx FDs leaked`);
+      }
+      
+    } catch (err) {
+      console.log('');
+      console.log('=======================================');
+      console.log(`❌ CRASHED at spawn ${i}`);
+      console.log('=======================================');
+      console.log(`Error: ${err.message}`);
+      console.log('');
+      
+      const ptmxFDs = getPtmxFDs();
+      console.log(`Leaked ptmx FDs at crash: ${ptmxFDs.length}`);
+      console.log('');
+      console.log('Leaked FDs:');
+      ptmxFDs.slice(0, 20).forEach(line => console.log('  ' + line));
+      if (ptmxFDs.length > 20) {
+        console.log(`  ... and ${ptmxFDs.length - 20} more`);
+      }
+      
+      console.log('');
+      console.log('This reproduces the error from github/copilot-cli#677:');
+      console.log('  "posix_spawnp failed"');
+      break;
     }
-    console.log('Process exited, kill() called');
-    
-    
-    // Wait for internal cleanup (socket destroy timeout is 200ms)
-    await sleep(500);
-    
-    const ptmxFDs = getPtmxFDs();
-    console.log(`\nptmx FDs after spawn ${i}: ${ptmxFDs.length}`);
-    ptmxFDs.forEach(line => console.log('  ' + line));
-    console.log('');
-    
-    // Pause between spawns so output is readable
-    await sleep(2000);
-  }
-  
-  console.log('=======================================');
-  console.log('FINAL STATE');
-  console.log('=======================================');
-  const finalPtmx = getPtmxFDs();
-  console.log(`Total ptmx FDs leaked: ${finalPtmx.length}`);
-  console.log('');
-  console.log('Leaked FDs:');
-  finalPtmx.forEach(line => console.log('  ' + line));
-  
-  if (finalPtmx.length > 0) {
-    console.log('');
-    console.log('❌ FD LEAK CONFIRMED');
-    console.log('');
-    console.log('Each spawn leaks 1 /dev/ptmx file descriptor.');
-    console.log('Over time, this leads to: "posix_spawnp failed" errors');
   }
 }
 
